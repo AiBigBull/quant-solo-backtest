@@ -134,26 +134,60 @@ func Run(input RunInput) (Result, error) {
 	}
 	annual := math.Pow(equity/input.StartEquity, 365.0/totalDays) - 1
 
+	worstFullCalendarYear := computeWorstFullCalendarYearReturn(monthly)
+
 	res := Result{
-		Params:                input.Params,
-		InitialEquity:         input.StartEquity,
-		FinalEquity:           equity,
-		CAGR:                  annual,
-		AnnualizedReturn:      annual,
-		MaxDrawdown:           maxDD,
-		Sharpe:                annualizedSharpe(dailyEquivalentReturns),
-		ProfitableMonths:      profitableMonths,
-		TotalMonths:           totalMonths,
-		ProfitableMonthsRatio: ratio(profitableMonths, totalMonths),
-		AllMonthsProfitable:   allMonthsProfitable,
-		MaxConsecutiveLosing:  maxConsecutiveLosing,
-		StrictMonthsEvaluated: len(strictMonthlyReturns),
-		AvgDailyTurnover:      totalTurnover / math.Max(float64(len(dailyEquivalentReturns)), 1),
-		TotalTrades:           totalTrades,
-		TransactionCostRatio:  totalCost / math.Max(float64(len(dailyEquivalentReturns)), 1),
-		MonthlyReturns:        monthly,
+		Params:                      input.Params,
+		InitialEquity:               input.StartEquity,
+		FinalEquity:                 equity,
+		CAGR:                        annual,
+		AnnualizedReturn:            annual,
+		MaxDrawdown:                 maxDD,
+		Sharpe:                      annualizedSharpe(dailyEquivalentReturns),
+		ProfitableMonths:            profitableMonths,
+		TotalMonths:                 totalMonths,
+		ProfitableMonthsRatio:       ratio(profitableMonths, totalMonths),
+		AllMonthsProfitable:         allMonthsProfitable,
+		MaxConsecutiveLosing:        maxConsecutiveLosing,
+		StrictMonthsEvaluated:       len(strictMonthlyReturns),
+		AvgDailyTurnover:            totalTurnover / math.Max(float64(len(dailyEquivalentReturns)), 1),
+		TotalTrades:                 totalTrades,
+		TransactionCostRatio:        totalCost / math.Max(float64(len(dailyEquivalentReturns)), 1),
+		MonthlyReturns:              monthly,
+		WorstFullCalendarYearReturn: worstFullCalendarYear,
 	}
 	return res, nil
+}
+
+// trendStrength converts the fast/slow MA spread into a bounded continuous signal in (-1, 1).
+// Using tanh so small spreads produce proportionally small signals and large spreads saturate
+// near ±1, eliminating the cliff-edge flip of the old binary ±1 approach.
+// The scaling factor 10 makes the signal reach ~0.76 at a 10% spread and ~0.96 at a 20% spread.
+func trendStrength(fast, slow float64) float64 {
+	if slow <= 0 {
+		return 0
+	}
+	spread := (fast - slow) / slow
+	return math.Tanh(spread * 10.0)
+}
+
+// volPenalty returns a smooth multiplier in [0, 1] for the score based on realized volatility.
+// Below 80% of the cap the multiplier is 1 (no penalty).
+// Between 80% and 100% of the cap it ramps linearly from 1 down to 0.
+// Above the cap it returns 0, fully suppressing the score.
+func volPenalty(vol, cap float64) float64 {
+	if cap <= 0 {
+		return 0
+	}
+	rampStart := 0.8 * cap
+	if vol <= rampStart {
+		return 1.0
+	}
+	if vol >= cap {
+		return 0.0
+	}
+	// linear ramp from 1 at rampStart to 0 at cap
+	return (cap - vol) / (cap - rampStart)
 }
 
 func computeWeights(symbols []string, closes map[string][]float64, i int, p Params) map[string]float64 {
@@ -163,12 +197,7 @@ func computeWeights(symbols []string, closes map[string][]float64, i int, p Para
 		c := closes[s]
 		fast := sma(c, i, p.FastMA)
 		slow := sma(c, i, p.SlowMA)
-		trendSignal := 0.0
-		if fast > slow {
-			trendSignal = 1.0
-		} else if fast < slow {
-			trendSignal = -1.0
-		}
+		trend := trendStrength(fast, slow)
 
 		mom := c[i]/c[i-p.MomentumLookback] - 1.0
 		vol := realizedVol(c, i, p.VolatilityLookback)
@@ -176,10 +205,8 @@ func computeWeights(symbols []string, closes map[string][]float64, i int, p Para
 			vol = 1e-6
 		}
 
-		score := p.TrendWeight*trendSignal + p.MomentumWeight*mom*10.0
-		if vol > p.VolatilityCap {
-			score = 0
-		}
+		score := p.TrendWeight*trend + p.MomentumWeight*mom*10.0
+		score *= volPenalty(vol, p.VolatilityCap)
 
 		riskAdj := score / vol
 		scores[s] = riskAdj
@@ -365,4 +392,65 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// computeWorstFullCalendarYearReturn calculates the worst compounded return
+// across complete 12-month interior calendar years only.
+// First and last months are excluded from this aggregation.
+// Returns 0 if no full calendar year exists.
+func computeWorstFullCalendarYearReturn(monthly map[string]float64) float64 {
+	if len(monthly) == 0 {
+		return 0
+	}
+
+	// Sort keys to identify interior months
+	keys := make([]string, 0, len(monthly))
+	for k := range monthly {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Exclude first and last month
+	start := 0
+	end := len(keys)
+	if len(keys) > 2 {
+		start = 1
+		end = len(keys) - 1
+	}
+
+	if end-start < 12 {
+		// Not enough interior months for a full calendar year
+		return 0
+	}
+
+	// Group interior months by year
+	yearReturns := map[string][]float64{}
+	for i := start; i < end; i++ {
+		monthKey := keys[i]
+		year := monthKey[:4] // Extract YYYY from YYYY-MM
+		yearReturns[year] = append(yearReturns[year], monthly[monthKey])
+	}
+
+	// Find worst full calendar year (all 12 months)
+	worstReturn := 0.0
+	foundFullYear := false
+	for _, monthlyVals := range yearReturns {
+		if len(monthlyVals) == 12 {
+			// Compound the 12 monthly returns
+			compounded := 1.0
+			for _, ret := range monthlyVals {
+				compounded *= (1.0 + ret)
+			}
+			yearReturn := compounded - 1.0
+			if !foundFullYear || yearReturn < worstReturn {
+				worstReturn = yearReturn
+				foundFullYear = true
+			}
+		}
+	}
+
+	if !foundFullYear {
+		return 0
+	}
+	return worstReturn
 }
