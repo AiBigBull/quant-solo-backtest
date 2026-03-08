@@ -22,6 +22,7 @@ type report struct {
 	Months             int             `json:"months"`
 	Iterations         int             `json:"iterations"`
 	CommitteePassRate  float64         `json:"committee_pass_rate"`
+	SelectedFrom       string          `json:"selected_from"`
 	BestDiscussed      backtest.Result `json:"best_discussed"`
 	BestOverall        backtest.Result `json:"best_overall"`
 	MeetsMonthlyGoal   bool            `json:"meets_monthly_goal"`
@@ -90,20 +91,29 @@ func main() {
 	}
 
 	best := summary.BestDiscussed
+	selectedFrom := "best_discussed"
 	if !best.CommitteePassed {
 		best = summary.BestOverall
+		selectedFrom = "best_overall_fallback"
 	}
 	passRate := float64(summary.PassedRuns) / float64(summary.TotalRuns)
 	meetsMonthly := best.ProfitableMonthsRatio >= 0.5
 	meetsStrictMonthly := best.AllMonthsProfitable
-	meetsAnnual := best.AnnualizedReturn >= 0.50
+	meetsAnnual := best.AnnualizedReturn >= 0.50 && best.CommitteePassed
+	meetsWorstFullYear := best.WorstFullCalendarYearReturn >= 0.40
 
-	conclusion := "Best strategy does not fully meet strict monthly + 50% annual target; continue iteration with robustness constraints."
-	if meetsMonthly && meetsAnnual {
-		conclusion = "Best discussed strategy meets relaxed monthly profitability and approximately 50% annual return target."
+	conclusion := "Selected strategy does not satisfy committee-approved 50% annual target; continue iteration with robustness constraints."
+	if !best.CommitteePassed {
+		conclusion = "No committee-approved strategy found; selected fallback is best overall for reference only."
+	} else if meetsMonthly && meetsAnnual && meetsWorstFullYear {
+		conclusion = "Best discussed strategy meets relaxed monthly profitability, approximately 50% annual return, and worst full calendar year targets."
+	} else if meetsMonthly && meetsAnnual && !meetsWorstFullYear {
+		conclusion = "Best discussed strategy meets relaxed monthly profitability and approximately 50% annual return targets, but worst full calendar year target not met."
 	}
-	if meetsStrictMonthly && meetsAnnual {
-		conclusion = "Best discussed strategy meets strict monthly profitability and approximately 50% annual return target."
+	if meetsStrictMonthly && meetsAnnual && meetsWorstFullYear {
+		conclusion = "Best discussed strategy meets strict monthly profitability, approximately 50% annual return, and worst full calendar year targets."
+	} else if meetsStrictMonthly && meetsAnnual && !meetsWorstFullYear {
+		conclusion = "Best discussed strategy meets strict monthly profitability and approximately 50% annual return targets, but worst full calendar year target not met."
 	}
 
 	rep := report{
@@ -114,6 +124,7 @@ func main() {
 		Months:             *months,
 		Iterations:         *iterations,
 		CommitteePassRate:  passRate,
+		SelectedFrom:       selectedFrom,
 		BestDiscussed:      summary.BestDiscussed,
 		BestOverall:        summary.BestOverall,
 		MeetsMonthlyGoal:   meetsMonthly,
@@ -165,6 +176,7 @@ func printSummary(r report) {
 	fmt.Printf("Symbols: %s\n", strings.Join(r.Symbols, ","))
 	fmt.Printf("Iterations: %d | Committee pass rate: %.2f%%\n", r.Iterations, r.CommitteePassRate*100)
 	fmt.Printf("Annualized Return: %.2f%% | Sharpe: %.2f | MaxDD: %.2f%%\n", best.AnnualizedReturn*100, best.Sharpe, best.MaxDrawdown*100)
+	fmt.Printf("Worst Full Calendar Year Return: %.2f%%\n", best.WorstFullCalendarYearReturn*100)
 	fmt.Printf("Profitable Months: %d/%d (%.2f%%)\n", best.ProfitableMonths, best.TotalMonths, best.ProfitableMonthsRatio*100)
 	fmt.Printf("All months profitable (strict core %d months): %t | Max consecutive losing months: %d\n", best.StrictMonthsEvaluated, best.AllMonthsProfitable, best.MaxConsecutiveLosing)
 	fmt.Printf("Monthly goal met: %t | Strict monthly goal met: %t | Annual 50%% target met: %t\n", r.MeetsMonthlyGoal, r.MeetsStrictMonthly, r.MeetsAnnualGoal)

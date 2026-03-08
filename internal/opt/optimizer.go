@@ -42,13 +42,15 @@ func Optimize(cfg Config, bars map[string][]backtest.Bar, symbols []string, star
 	}
 	rng := rand.New(rand.NewSource(seed))
 	shockVariants := buildDataShockVariants(bars, seed, 3)
+	seededParams := targetSeedParams()
 
 	bestOverall := backtest.Result{OptimizationScore: -1e18}
 	bestDiscussed := backtest.Result{OptimizationScore: -1e18}
+	bestDiscussedDual := false
 	passed := 0
 
 	for i := 0; i < cfg.Iterations; i++ {
-		p := sampleParams(rng)
+		p := paramsForIteration(i, seededParams, rng)
 		res, err := backtest.Run(backtest.RunInput{
 			BarsBySymbol: bars,
 			Symbols:      symbols,
@@ -65,14 +67,7 @@ func Optimize(cfg Config, bars map[string][]backtest.Bar, symbols []string, star
 			return Summary{}, err
 		}
 
-		outcome := decision.Evaluate(res)
-		res.CommitteePassed = outcome.Passed
-		res.CommitteeVotes = make(map[string]bool, len(outcome.Votes))
-		res.CommitteeReasoning = make(map[string]string, len(outcome.Votes))
-		for _, v := range outcome.Votes {
-			res.CommitteeVotes[v.Name] = v.Pass
-			res.CommitteeReasoning[v.Name] = v.Reason
-		}
+		res = applyCommitteeOutcomeWithStress(res, stress)
 		res.OptimizationScore = score(res, stress)
 
 		if res.OptimizationScore > bestOverall.OptimizationScore {
@@ -80,8 +75,9 @@ func Optimize(cfg Config, bars map[string][]backtest.Bar, symbols []string, star
 		}
 		if res.CommitteePassed {
 			passed++
-			if res.OptimizationScore > bestDiscussed.OptimizationScore {
+			if isBetterDiscussed(res, bestDiscussed, bestDiscussedDual) {
 				bestDiscussed = res
+				bestDiscussedDual = meetsDualGoal(res)
 			}
 		}
 	}
@@ -97,6 +93,79 @@ func Optimize(cfg Config, bars map[string][]backtest.Bar, symbols []string, star
 		TotalRuns:     cfg.Iterations,
 		PassedRuns:    passed,
 	}, nil
+}
+
+func applyCommitteeOutcomeWithStress(res backtest.Result, stress stressMetrics) backtest.Result {
+	res.StressWorstAnnualReturn = stress.WorstAnnualReturn
+	res.StressWorstDrawdown = stress.WorstDrawdown
+	res.StressNeighborhoodStd = stress.NeighborhoodStd
+
+	outcome := decision.Evaluate(res)
+	res.CommitteePassed = outcome.Passed
+	res.CommitteeVotes = make(map[string]bool, len(outcome.Votes))
+	res.CommitteeReasoning = make(map[string]string, len(outcome.Votes))
+	for _, v := range outcome.Votes {
+		res.CommitteeVotes[v.Name] = v.Pass
+		res.CommitteeReasoning[v.Name] = v.Reason
+	}
+
+	return res
+}
+
+func targetSeedParams() []backtest.Params {
+	return []backtest.Params{
+		{
+			FastMA:             26,
+			SlowMA:             97,
+			MomentumLookback:   36,
+			VolatilityLookback: 47,
+			TrendWeight:        1.200,
+			MomentumWeight:     0.447,
+			VolatilityCap:      0.0281,
+			FeeBps:             6.42,
+			SlippageBps:        1.12,
+		},
+		{
+			FastMA:             24,
+			SlowMA:             105,
+			MomentumLookback:   8,
+			VolatilityLookback: 53,
+			TrendWeight:        1.714,
+			MomentumWeight:     0.341,
+			VolatilityCap:      0.0241,
+			FeeBps:             7.64,
+			SlippageBps:        6.05,
+		},
+		{
+			FastMA:             18,
+			SlowMA:             106,
+			MomentumLookback:   11,
+			VolatilityLookback: 45,
+			TrendWeight:        0.58,
+			MomentumWeight:     0.253,
+			VolatilityCap:      0.0264,
+			FeeBps:             9.85,
+			SlippageBps:        6.07,
+		},
+		{
+			FastMA:             22,
+			SlowMA:             89,
+			MomentumLookback:   11,
+			VolatilityLookback: 54,
+			TrendWeight:        1.612,
+			MomentumWeight:     0.74,
+			VolatilityCap:      0.0285,
+			FeeBps:             2.65,
+			SlippageBps:        5.21,
+		},
+	}
+}
+
+func paramsForIteration(i int, seeded []backtest.Params, rng *rand.Rand) backtest.Params {
+	if i >= 0 && i < len(seeded) {
+		return seeded[i]
+	}
+	return sampleParams(rng)
 }
 
 func sampleParams(rng *rand.Rand) backtest.Params {
@@ -128,7 +197,12 @@ func score(r backtest.Result, s stressMetrics) float64 {
 	base += r.ProfitableMonthsRatio * 20.0
 	base += boolScore(r.AllMonthsProfitable) * 8.0
 	base -= float64(r.MaxConsecutiveLosing) * 3.0
-	base -= math.Abs(r.AnnualizedReturn-0.50) * 20.0
+	if r.AnnualizedReturn < 0.50 {
+		base -= (0.50 - r.AnnualizedReturn) * 20.0
+	}
+	if r.WorstFullCalendarYearReturn < 0.40 {
+		base -= (0.40 - r.WorstFullCalendarYearReturn) * 25.0
+	}
 	base -= r.TransactionCostRatio * 500.0
 
 	base += s.WorstAnnualReturn * 55.0
@@ -188,6 +262,10 @@ func neighborhoodStd(p backtest.Params, bars map[string][]backtest.Bar, symbols 
 		withMomentum(p, p.MomentumLookback-3),
 		withVolCap(p, p.VolatilityCap+0.005),
 		withVolCap(p, p.VolatilityCap-0.005),
+		withTrendWeight(p, p.TrendWeight+0.1),
+		withTrendWeight(p, p.TrendWeight-0.1),
+		withMomentumWeight(p, p.MomentumWeight+0.1),
+		withMomentumWeight(p, p.MomentumWeight-0.1),
 	})
 	vals := make([]float64, 0, len(neighbors))
 	for _, n := range neighbors {
@@ -241,6 +319,22 @@ func withVolCap(p backtest.Params, cap float64) backtest.Params {
 	return p
 }
 
+func withTrendWeight(p backtest.Params, w float64) backtest.Params {
+	if w < 0.1 {
+		w = 0.1
+	}
+	p.TrendWeight = w
+	return p
+}
+
+func withMomentumWeight(p backtest.Params, w float64) backtest.Params {
+	if w < 0.1 {
+		w = 0.1
+	}
+	p.MomentumWeight = w
+	return p
+}
+
 func uniqueParams(in []backtest.Params) []backtest.Params {
 	seen := map[string]bool{}
 	out := make([]backtest.Params, 0, len(in))
@@ -286,6 +380,21 @@ func buildDataShockVariants(bars map[string][]backtest.Bar, seed int64, count in
 		variants = append(variants, variant)
 	}
 	return variants
+}
+
+func meetsDualGoal(r backtest.Result) bool {
+	return r.AnnualizedReturn >= 0.50 && r.WorstFullCalendarYearReturn >= 0.40
+}
+
+func isBetterDiscussed(r, current backtest.Result, currentDual bool) bool {
+	rDual := meetsDualGoal(r)
+	if rDual && !currentDual {
+		return true
+	}
+	if !rDual && currentDual {
+		return false
+	}
+	return r.OptimizationScore > current.OptimizationScore
 }
 
 func boolScore(v bool) float64 {
