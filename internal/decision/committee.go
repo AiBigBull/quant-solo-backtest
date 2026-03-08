@@ -32,8 +32,8 @@ func Evaluate(res backtest.Result) Outcome {
 }
 
 func researchVote(res backtest.Result) Vote {
-	pass := res.Sharpe >= 0.8 && res.AnnualizedReturn >= 0.20
-	reason := "Sharpe>=0.8 and annual return>=20%"
+	pass := res.Sharpe >= 0.8 && res.AnnualizedReturn >= 0.35
+	reason := "Sharpe>=0.8 and annual return>=35%"
 	if !pass {
 		reason = "alpha robustness below threshold"
 	}
@@ -41,10 +41,12 @@ func researchVote(res backtest.Result) Vote {
 }
 
 func riskVote(res backtest.Result) Vote {
-	pass := res.MaxDrawdown <= 0.25
-	reason := "max drawdown <=25%"
+	pass := res.MaxDrawdown <= 0.25 &&
+		res.StressWorstDrawdown <= 0.40 &&
+		res.StressWorstAnnualReturn >= -0.20
+	reason := "max drawdown <=25%, stress worst drawdown <=40%, stress worst annual return >=-20%"
 	if !pass {
-		reason = "drawdown too high"
+		reason = "drawdown or stress risk exceeds limit"
 	}
 	return Vote{Name: "Risk Manager", Pass: pass, Reason: reason}
 }
